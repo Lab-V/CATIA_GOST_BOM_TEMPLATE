@@ -1,0 +1,488 @@
+Option Explicit
+
+'	COPYRIGHT DASSAULT SYSTÈMES 2007
+' 	****************************************************************************
+' 	Purpose			:	To draw a "Specification" - BOM according with Russian factory standards
+' 	Author				:	Ilias Ilmambetov - lab.virtuosity.ru
+'	Based on			:	V5Automation guide and online forums
+' 	Languages		:	VBScript
+' 	CATIA Level		:	V5R15
+' 	Reg. Settings	:	Russian
+'	Revision			:	20070816
+' 	****************************************************************************
+
+
+'	DEFINE PROPERTIES
+' 	****************************************************************************
+'	Variable names created by Naming Conventions in V5Automation guide:
+'	prefix o- mean Object, d- Double, s- String, a- Array
+' 	****************************************************************************
+
+Public oDocument			As DrawingDocument		' NOT Document - for correct use oDrwTexts.GetItem("ItemName")
+Public oSelection				As Selection
+Public oSheets					As DrawingSheets
+Public oSheet					As DrawingSheet
+Public oView						As DrawingView
+Public oDrwTexts				As DrawingTexts
+Public oText						As DrawingText
+Public oOrientation			As CatPaperOrientation
+
+Public oFactory				As Factory2D
+Public oLine						As Line2D
+
+Public oGeomElements		As GeometricElements
+
+Public dWidth					As Double	' Sheet width
+Public dHeight					As Double	' Sheet height
+
+Public dOffsetV				As Double	' distance between sheet origin Y and lowest line in specification
+
+Public aNotifyText			As Array
+Public aNotifyIcon			As Array
+aNotifyText = Array("Спецификация уже создана", "Внимание!"&Chr(10)&"Сначала необходимо создать таблицу спецификации - команда 'Add'", "Внимание!"&Chr(13)&"Для этого макроса требуется создать чертежный документ (Drawing)")
+aNotifyIcon = Array(vbInformation, vbExclamation, vbExclamation)
+
+
+'	CORE METHODS - UserNotify
+' 	****************************************************************************
+'	Shows message box with predefined text for some events
+' 	****************************************************************************
+Sub UserNotify(iNotifyID As Integer)
+	MsgBox aNotifyText(iNotifyID), aNotifyIcon(iNotifyID), "CATScript Message:"
+End Sub
+
+
+'	CORE METHODS - WriteText
+' 	****************************************************************************
+'	Add text string object with predefined parameters
+' 	****************************************************************************
+Sub WriteText(textName, textValue, anchorPos As String, textSize, textX, textY, textAngle, wrapWidth, textAlign As Double)
+	Set oText = oDrwTexts.Add(textValue, textX, textY)
+	oText.Name = textName
+	oText.SetFontSize  0, 0, textSize
+	oText.Angle = textAngle
+	oText.AnchorPosition = anchorPos
+	oText.FrameType = catRectangle
+	oText.WrappingWidth = wrapWidth	' if wrapWidth = 0 - no wrap
+	oText.SetParameterOnSubString catAlignment, 0, 0, textAlign		' textAlign = 0 - left, 1 - center, 2 - right
+End Sub
+
+
+'	CORE METHODS - DrawLine
+' 	****************************************************************************
+'	Add line object with predefined parameters
+' 	****************************************************************************
+Sub DrawLine(lineName As String, startX, startY, endX, endY, lineW As Double)
+	Set oLine = oFactory.CreateLine(startX, startY, endX, endY)
+	oLine.Name = lineName
+	oSelection.Clear
+	oSelection.Add(oLine)
+	oSelection.VisProperties.SetRealWidth lineW, 1
+	oSelection.Clear
+End Sub
+
+
+'	CORE METHODS - CATInit
+' 	****************************************************************************
+'	Set variables
+' 	****************************************************************************
+Sub CATInit()
+	Set oDocument = CATIA.ActiveDocument
+	Set oSheets = oDocument.Sheets
+	Set oSheet = oDocument.Sheets.ActiveSheet
+	oOrientation = oSheet.Orientation
+	Set oSelection = oDocument.Selection
+	Set oView  = oSheet.Views.ActiveView
+	Set oDrwTexts = oView.Texts
+
+	Set oFactory = oView.Factory2D
+	Set oGeomElements = oView.GeometricElements
+
+	dWidth = oSheet.GetPaperWidth
+	dHeight = oSheet.GetPaperHeight
+
+	dOffsetV = 76
+End Sub
+
+
+'	CORE METHODS - CATExit
+' 	****************************************************************************
+'	Save edition in order to register modification for UNDO/REDO
+' 	****************************************************************************
+Sub CATExit()
+	oView.SaveEdition
+End Sub
+
+
+'	CORE METHODS - CATMain
+' 	****************************************************************************
+'	Invoked on script start
+' 	****************************************************************************
+Sub CATMain()
+	If (IsDrawingDocument()) Then	
+		CATInit
+		If (Not SpecOnSheet()) Then
+			CATDrw_Add
+		Else
+			CATDrw_Update
+		End If
+		CATExit
+	Else
+		UserNotify 2
+		Exit Sub
+	End If
+End Sub
+
+
+'	USER INTERACT METHODS - CATDrw_Add
+' 	****************************************************************************
+'	Define parameters for create Specification
+' 	****************************************************************************
+Sub CATDrw_Add()
+	CATInit
+		Dim sQueryForRows	As String
+		Dim dUserRows			As Double
+	If (SpecOnSheet()) Then
+		UserNotify 0
+		Exit Sub
+	Else
+		' ADD SPECIFICATION
+		sQueryForRows = InputBox ("Введите количество строк в спецификации: "&Chr(10)&"(макс. "+CStr(MaxRows())+" для этого формата листа)", "CATScript Query:", MaxRows())	
+		If (Len(sQueryForRows) = 0) Then
+			Exit Sub		' User clicks _Cancel_ button
+		Else
+			dUserRows = CDbl(sQueryForRows)
+			createSpec dUserRows
+		End If
+	End If
+	CATExit
+End Sub
+
+
+'	USER INTERACT METHODS - CATDrw_Update
+' 	****************************************************************************
+'	Move Specification when sheet dimensions changed
+' 	****************************************************************************
+Sub CATDrw_Update()
+	CATInit
+	If (SpecOnSheet()) Then
+		' MOVE SPEC
+		MoveSpec(SpecOffsetX())
+	Else
+		UserNotify 1
+		Exit Sub
+	End If
+End Sub
+
+
+'	USER INTERACT METHODS - CATDrw_Remove
+' 	****************************************************************************
+'	Delete Specification
+' 	****************************************************************************
+Sub CATDrw_Remove()
+	CATInit
+	If (SpecOnSheet()) Then
+		' DELETE SPEC
+		RemoveText
+		RemoveGeometry
+	Else
+		UserNotify 1
+		Exit Sub
+	End If
+End Sub
+
+
+'	BASIC METHODS - createSpec
+' 	****************************************************************************
+'	Create geometry and text object for Specification
+' 	****************************************************************************
+Sub createSpec(dRows As Double)
+	Dim i										As Integer
+	Dim j										As Integer
+	Dim k									As Integer
+	Dim m									As Integer
+	Dim sLineName						As String
+	Dim sTextName					As String
+	Dim dTotalRows					As Double
+	Dim dSpecX							As Double	' Top left corner of table
+	Dim dSpecY							As Double
+	Dim dSpecStartX					As Double
+	Dim dSpecEndX					As Double
+	Dim dSpecStartY					As Double
+	Dim dSpecEndY					As Double
+	Dim aSpecOffsetX				As Array		' xPos for V-Lines
+	Dim aSpecOffsetY				As Array		' yPos for H-Lines
+	Dim aSpecHeaderTextX		As Array
+	Dim dSpecHeaderTextY		As Double
+	Dim aSpecTextX					As Array
+	Dim dSpecTextY					As Double
+	Dim aSpecTextWidth			As Array
+	Dim dThinLineY						As Double
+
+	
+	If (MaxRows() > dRows) Then
+		dSpecY = dOffsetV + dRows*8 + 15		' V-Offset from sheet origin Y + sum rows height + title height
+		dTotalRows = dRows
+	Else
+		dSpecY = dHeight - 5						' Y-pos on top border line
+		dTotalRows = MaxRows()
+		removeTopTable								' if frame and title block created by GOSTFTB2
+	End If
+
+	dSpecX = dWidth - 190
+	dSpecStartX = dSpecX
+	dSpecEndX = dSpecStartX + 185
+	dSpecStartY = dSpecY
+	dSpecEndY = dOffsetV
+
+	aSpecOffsetX = Array(dSpecX, dSpecX + 6, dSpecX + 12, dSpecX + 20, dSpecX + 90, dSpecX + 153, dSpecX + 163)
+	aSpecOffsetY = Array(dSpecY, dSpecY - 15, dSpecEndY)
+	aSpecHeaderTextX = Array(dSpecX + 3, dSpecX + 9, dSpecX + 16, dSpecX + 55, dSpecX + 121.5, dSpecX + 158, dSpecX + 174)
+	dSpecHeaderTextY = dSpecY - 7.5
+	aSpecTextX = Array(dSpecX + 3, dSpecX + 9, dSpecX + 16, dSpecX + 21, dSpecX + 91, dSpecX + 158, dSpecX + 164)
+	aSpecTextWidth = Array(6, 6, 7, 69, 62, 9, 21)
+
+	' ADD THICK H-LINES - FROM TOP TO BOTTOM
+	For i = 0 To 2
+		sLineName = "spec_line_"&(i + 1)
+		DrawLine sLineName, dSpecStartX, aSpecOffsetY(i), dSpecEndX, aSpecOffsetY(i), 2
+	Next
+
+	' ADD THICK V-LINES - FROM LEFT TO RIGHT
+	For j = 0 To 6
+		sLineName = "spec_line_"&(j + 4)
+		DrawLine sLineName, aSpecOffsetX(j), dSpecStartY, aSpecOffsetX(j), dSpecEndY, 2
+	Next
+
+	' ADD TABLE TITLES
+	WriteText "spec_text_headerFormats", "Формат", catMiddleCenter, 3, aSpecHeaderTextX(0), dSpecHeaderTextY, 90, 15, 1
+	WriteText "spec_text_headerZones", "Зона", catMiddleCenter, 3, aSpecHeaderTextX(1), dSpecHeaderTextY, 90, 15, 1
+	WriteText "spec_text_headerItems", "Поз.", catMiddleCenter, 3, aSpecHeaderTextX(2), dSpecHeaderTextY, 90, 15, 1
+	WriteText "spec_text_headerIDs", "Обозначение", catMiddleCenter, 3, aSpecHeaderTextX(3), dSpecHeaderTextY, 0, 50, 1
+	WriteText "spec_text_headerNames", "Наименование", catMiddleCenter, 3, aSpecHeaderTextX(4), dSpecHeaderTextY, 0, 55, 1
+	WriteText "spec_text_headerAmounts", "Кол.", catMiddleCenter, 3, aSpecHeaderTextX(5), dSpecHeaderTextY, 90, 15, 1
+	WriteText "spec_text_headerNotes", "Примечание", catMiddleCenter, 3, aSpecHeaderTextX(6), dSpecHeaderTextY, 0, 20, 1
+
+	' ADD TEXT STRINGS AND THIN LINES
+	For k = 0 To (dTotalRows - 1)	
+
+		' ADD EMPTY TEXT STRINGS - FROM TOP TO BOTTOM
+		dSpecTextY = dSpecY - 15 - 8*k - 4
+		For m = 0 To 6
+			sTextName = "spec_text_"&(k + 1)&"_"&(m + 1)
+			If (m = 3 Or m = 4 Or m = 6) Then
+				WriteText sTextName, "##", catTopLeft, 2.5, aSpecTextX(m), dSpecTextY, 0, aSpecTextWidth(m), 0
+			Else
+				WriteText sTextName, "##", catTopCenter, 2.5, aSpecTextX(m), dSpecTextY, 0, aSpecTextWidth(m), 1
+			End If
+		Next
+
+		' ADD THIN H-LINES - FROM TOP TO BOTTOM
+		If (k > 0) Then
+			sLineName = "spec_line_"&(k+ 10)
+			dThinLineY = dSpecY - 15 - 8*k
+			DrawLine sLineName, dSpecStartX, dThinLineY, dSpecEndX, dThinLineY, 1
+		End If
+	Next
+End Sub
+
+
+'	BASIC METHODS - MoveSpec
+' 	****************************************************************************
+'	Method for move Specification on sheet resize
+' 	****************************************************************************
+Sub MoveSpec(stepX As Double)
+	Dim oTargetLine		As Line2D
+	Dim lStepLines			As Long
+	Dim lTotalLines			As Long
+	Dim sLineName			As String
+	Dim aDirection(2)		As Array
+	Dim aOrigin(2)			As Array
+
+	Dim lTotalText			As Long
+	Dim lStepText			As Long
+	Dim oTargetText		As DrawingText
+	Dim sTextName		As String
+
+	If (stepX = 0) Then
+		Exit Sub
+	End If
+
+	sLineName = "spec_line_"
+	lTotalLines = oGeomElements.Count
+
+	For lStepLines = 1 To lTotalLines
+		Set oTargetLine = oGeomElements.Item(lStepLines)
+		If (Left(oTargetLine.Name, 10) = sLineName) Then
+			oTargetLine.GetDirection(aDirection)
+			oTargetLine.GetOrigin(aOrigin)
+			oTargetLine.SetData aOrigin(0)+stepX, aOrigin(1), aDirection(0), aDirection(1)
+		End If
+	Next
+
+	sTextName = "spec_text_"
+	lTotalText = oDrwTexts.Count
+	For lStepText = 1 To  lTotalText
+		Set oTargetText = oDrwTexts.Item(lStepText)
+		If (Left(oTargetText.Name, 10) = sTextName) Then
+			oTargetText.x = oTargetText.x + stepX
+		End If
+	Next
+End Sub
+
+
+'	BASIC METHODS - RemoveText and RemoveGeometry
+' 	****************************************************************************
+'	Methods for delete Specification on sheet resize
+' 	****************************************************************************
+Sub RemoveText()
+	Dim lTotalText			As Long
+	Dim lStepText			As Long
+	Dim oTargetText		As DrawingText
+	Dim sTextName		As String
+
+	oSelection.Clear
+
+	sTextName = "spec_text_"
+	lTotalText = oDrwTexts.Count
+
+	For lStepText = 1 To  lTotalText
+		Set oTargetText = oDrwTexts.Item(lStepText)
+		If (Left(oTargetText.Name, 10) = sTextName) Then
+			oSelection.Add(oTargetText)
+		End If
+	Next
+	oSelection.Delete
+End Sub
+
+Sub RemoveGeometry()
+	Dim oTargetLine		As Line2D
+	Dim lStepLines			As Long
+	Dim lTotalLines			As Long
+	Dim sLineName			As String
+	
+	oSelection.Clear
+
+	sLineName = "spec_line_"
+	lTotalLines = oGeomElements.Count
+
+	For lStepLines = 1 To lTotalLines
+		Set oTargetLine = oGeomElements.Item(lStepLines)
+		If (Left(oTargetLine.Name, 10) = sLineName) Then
+			oSelection.Add(oTargetLine)
+		End If
+	Next
+	oSelection.Delete
+End Sub
+
+
+'	BASIC METHODS - removeTopTable
+' 	****************************************************************************
+'	Method for delete top table in frame title block created by GOSTFTB2, if Specification have MaxRows
+' 	****************************************************************************
+Sub removeTopTable
+	Dim i	As Integer
+	Dim oTargetLine	As Line2D
+	Dim oTargetText	As DrawingText
+
+	If (oOrientation = 0 And CheckMacroID()) Then
+		' SELECT TOP LINES
+		oSelection.Clear
+		For i = 1 To 2
+			Set oTargetLine = oGeomElements.Item("top_line_"&i)
+			oSelection.Add(oTargetLine)
+		Next
+
+		Set oTargetText = oDrwTexts.GetItem("top_text_1")
+		' SELECT TOP TEXT
+		oSelection.Add(oTargetText)
+
+		' REMOVE SELECTED ITEMS
+    	oSelection.Delete
+	End If
+End Sub
+
+
+'	SUPPORT METHODS - SpecOnSheet
+' 	****************************************************************************
+'	Check reference for Macro identification
+' 	****************************************************************************
+Function SpecOnSheet() As Boolean
+	Dim dTotalText	As Double
+	Dim dStep			As Double
+	Dim oCheckText	As Object
+
+	dTotalText = oDrwTexts.Count
+	dStep = 0
+
+	While (dStep < dTotalText)
+		dStep = dStep + 1
+		Set oCheckText = oDrwTexts.Item(dStep)
+		If (oCheckText.Name = "spec_text_headerNames") Then	' Name for static text
+			SpecOnSheet = True
+			Exit Function
+		End If
+	Wend
+	SpecOnSheet = False
+End Function
+
+
+'	SUPPORT METHODS - SpecOffsetX
+' 	****************************************************************************
+'	Calc OffsetX for MoveSpec Method
+' 	****************************************************************************
+Function SpecOffsetX() As Double
+	Dim oBaseLine		As Line2D
+	Dim aOrigin(2)		As Array
+	
+	Set oBaseLine = oGeomElements.Item("spec_line_4")	' LEFT BORDER LINE
+	oBaseLine.GetOrigin(aOrigin)
+
+	SpecOffsetX = dWidth - 190 - aOrigin(0)
+End Function
+
+
+'	SUPPORT METHODS - MaxRows
+' 	****************************************************************************
+'	Max amount of rows in current sheet format
+' 	****************************************************************************
+Function MaxRows() As Double
+	MaxRows = Round((dHeight - dOffsetV - 20)/8)	' Spec. title height(15mm) + offset from sheet edge (5mm) = 20
+End Function
+
+
+'	SUPPORT METHODS - CheckMacroID
+' 	****************************************************************************
+'	Check reference for Macro identification
+' 	****************************************************************************
+Function CheckMacroID() As Boolean
+	Dim dTotalText	As Double
+	Dim dStep			As Double
+	Dim oCheckText	As Object
+
+	dTotalText = oDrwTexts.Count
+	dStep = 0
+
+	While (dStep < dTotalText)
+		dStep = dStep + 1
+		Set oCheckText = oDrwTexts.Item(dStep)
+		If (oCheckText.Name = "GOST_FTB") Then
+			CheckMacroID = True
+			Exit Function
+		End If
+	Wend
+	CheckMacroID = False
+End Function
+
+
+'	SUPPORT METHODS - IsDrawingDocument
+' 	****************************************************************************
+'	Check for active document type
+' 	****************************************************************************
+Function IsDrawingDocument() As Boolean
+	If (TypeName(CATIA.ActiveDocument) = "DrawingDocument") Then
+		IsDrawingDocument = True
+	Else
+		IsDrawingDocument = False
+	End If
+End Function
